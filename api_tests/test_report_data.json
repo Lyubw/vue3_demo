@@ -1,0 +1,272 @@
+[
+  {
+    "endpoint_or_module": "GET /users",
+    "case_id": "TC-001",
+    "type": "positive",
+    "expected": "success",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 200,
+      "body": [
+        {
+          "id": 1,
+          "name": "Leanne Graham",
+          "username": "Bret",
+          "email": "Sincere@april.biz",
+          "address": {
+            "street": "Kulas Light",
+            "suite": "Apt. 556",
+            "city": "Gwenborough",
+            "zipcode": "92998-3874",
+            "geo": {
+              "lat": "-37.3159",
+              "lng": "81.1496"
+            }
+          },
+          "phone": "1-770-736-8031 x56442",
+          "website": "hildegard.org",
+          "company": {
+            "name": "Romaguera-Crona",
+            "catchPhrase": "Multi-layered client-server neural-net",
+            "bs": "harness real-time e-markets"
+          }
+        },
+        {
+          "id": 2,
+          "name": "Ervin Howell",
+          "username": "Antonette",
+          "email": "Shanna@melissa.tv",
+          "address": {
+            "street": "Victor Plains",
+            "suite": "Suite 879",
+            "city": "Wisokyburgh",
+            "zipcode": "90566-7771",
+            "geo": {
+              "lat": "-43.9509",
+              "lng": "-34.4618"
+            }
+          },
+          "phone": "010-692-6593 x09125",
+          "website": "anastasia.net",
+          "company": {
+            "name": "Deckow-Crist",
+            "catchPhrase": "Proactive didactic contingency",
+            "bs": "synergize scalable supply-chains"
+          }
+        }
+      ]
+    },
+    "verdict_reason": "期望200且返回数组"
+  },
+  {
+    "endpoint_or_module": "GET /users/{id}",
+    "case_id": "TC-002",
+    "type": "negative",
+    "expected": "failure",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users/abc",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 404,
+      "body": {}
+    },
+    "verdict_reason": "非数字ID应返回4xx/5xx"
+  },
+  {
+    "endpoint_or_module": "GET /users/{id}",
+    "case_id": "TC-003",
+    "type": "positive",
+    "expected": "success",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users/1",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "id": 1,
+        "name": "Leanne Graham",
+        "username": "Bret",
+        "email": "Sincere@april.biz",
+        "address": {
+          "street": "Kulas Light",
+          "suite": "Apt. 556",
+          "city": "Gwenborough",
+          "zipcode": "92998-3874",
+          "geo": {
+            "lat": "-37.3159",
+            "lng": "81.1496"
+          }
+        },
+        "phone": "1-770-736-8031 x56442",
+        "website": "hildegard.org",
+        "company": {
+          "name": "Romaguera-Crona",
+          "catchPhrase": "Multi-layered client-server neural-net",
+          "bs": "harness real-time e-markets"
+        }
+      }
+    },
+    "verdict_reason": "有效用户返回正确"
+  },
+  {
+    "endpoint_or_module": "GET /users/{id}",
+    "case_id": "TC-004",
+    "type": "negative",
+    "expected": "failure",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users/0",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 404,
+      "body": {}
+    },
+    "verdict_reason": "无效ID应失败"
+  },
+  {
+    "endpoint_or_module": "GET /users/{id}",
+    "case_id": "TC-005",
+    "type": "negative",
+    "expected": "failure",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/users/999",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 404,
+      "body": {}
+    },
+    "verdict_reason": "不存在应失败或空"
+  },
+  {
+    "endpoint_or_module": "GET /posts",
+    "case_id": "TC-006",
+    "type": "positive",
+    "expected": "success",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/posts",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 200,
+      "body": [
+        {
+          "userId": 1,
+          "id": 1,
+          "title": "sunt aut facere repellat provident occaecati excepturi optio reprehenderit",
+          "body": "quia et suscipit\nsuscipit recusandae consequuntur expedita et cum\nreprehenderit molestiae ut ut quas totam\nnostrum rerum est autem sunt rem eveniet architecto"
+        }
+      ]
+    },
+    "verdict_reason": "返回帖子列表"
+  },
+  {
+    "endpoint_or_module": "GET /posts/{id}",
+    "case_id": "TC-007",
+    "type": "positive",
+    "expected": "success",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/posts/1",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "userId": 1,
+        "id": 1,
+        "title": "sunt aut facere repellat provident occaecati excepturi optio reprehenderit",
+        "body": "quia et suscipit\nsuscipit recusandae consequuntur expedita et cum\nreprehenderit molestiae ut ut quas totam\nnostrum rerum est autem sunt rem eveniet architecto"
+      }
+    },
+    "verdict_reason": "有效帖子"
+  },
+  {
+    "endpoint_or_module": "GET /posts/{id}",
+    "case_id": "TC-008",
+    "type": "negative",
+    "expected": "failure",
+    "execution_result": "PASS",
+    "request": {
+      "method": "GET",
+      "url": "https://jsonplaceholder.typicode.com/posts/-1",
+      "params": {},
+      "body": {}
+    },
+    "response": {
+      "status": 404,
+      "body": {}
+    },
+    "verdict_reason": "负ID应失败"
+  },
+  {
+    "endpoint_or_module": "POST /posts",
+    "case_id": "TC-009",
+    "type": "positive",
+    "expected": "success",
+    "execution_result": "PASS",
+    "request": {
+      "method": "POST",
+      "url": "https://jsonplaceholder.typicode.com/posts",
+      "params": {},
+      "body": {
+        "title": "test",
+        "body": "content",
+        "userId": 1
+      }
+    },
+    "response": {
+      "status": 201,
+      "body": {
+        "title": "test",
+        "body": "content",
+        "userId": 1,
+        "id": 101
+      }
+    },
+    "verdict_reason": "创建成功"
+  },
+  {
+    "endpoint_or_module": "POST /posts",
+    "case_id": "TC-010",
+    "type": "negative",
+    "expected": "failure",
+    "execution_result": "PASS",
+    "request": {
+      "method": "POST",
+      "url": "https://jsonplaceholder.typicode.com/posts",
+      "params": {},
+      "body": "invalid"
+    },
+    "response": {
+      "status": 500,
+      "body": "SyntaxError: Unexpected token i in JSON at position 0\n    at JSON.parse (<anonymous>)\n    at createStrictSyntaxError (/app/node_modules/body-parser/lib/types/json.js:158:10)\n    at parse (/app/node_mo"
+    },
+    "verdict_reason": "非法JSON应拒绝"
+  }
+]
