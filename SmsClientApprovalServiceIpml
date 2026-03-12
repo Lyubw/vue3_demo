@@ -1,0 +1,1116 @@
+package com.lcfc.sms.service.approval;
+
+import cn.hutool.core.collection.CollectionUtil;
+import cn.hutool.core.util.IdUtil;
+import cn.hutool.core.util.StrUtil;
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.lcfc.sms.common.constants.Constant;
+import com.lcfc.sms.common.enums.*;
+import com.lcfc.sms.common.feign.AdminFeign;
+import com.lcfc.sms.common.feign.vo.UserInfoQryReq;
+import com.lcfc.sms.common.feign.vo.UserInfoQryResp;
+import com.lcfc.sms.common.util.DateUtil;
+import com.lcfc.sms.common.util.PageUtils;
+import com.lcfc.sms.common.util.SmsInfoRedisInitUtil;
+import com.lcfc.sms.common.util.SmsRedisUtil;
+import com.lcfc.sms.controller.reqvo.*;
+import com.lcfc.sms.controller.respvo.SmsClientApprovalPageResp;
+import com.lcfc.sms.controller.respvo.SmsClientQuotaPageResp;
+import com.lcfc.sms.controller.respvo.SmsClientQuotaUsableResp;
+import com.lcfc.sms.controller.respvo.SmsQuotaRechargePageResp;
+import com.lcfc.sms.core.ISmsHandler;
+import com.lcfc.sms.core.SmsHandleBean;
+import com.lcfc.sms.dao.entity.*;
+import com.lcfc.sms.dao.mapper.SmsClientMapper;
+import com.lcfc.sms.dao.mapper.SmsQuotaMapper;
+import com.lcfc.sms.dao.mapper.SmsQuotaRechargeMapper;
+import com.lcfc.sms.dao.mapper.SmsServerMapper;
+import com.lcfc.sms.dto.ClientMailSendParams;
+import com.lcfc.sms.dto.ServerParams;
+import com.lcfc.sms.service.client.SmsClientServiceIpml;
+import com.lcfc.sms.service.template.SmsTemplateServiceImpl;
+import com.lcfc.starter.client.mail.util.MailClientUtil;
+import com.lcfc.starter.common.constants.SmsConstants;
+import com.lcfc.starter.common.dto.mail.ClientParam;
+import com.lcfc.starter.common.dto.mail.MailParamsBuilder;
+import com.lcfc.starter.common.dto.mail.MailResponse;
+import com.lcfc.starter.common.dto.sms.SmsClientInfo;
+import com.lcfc.starter.common.dto.sms.SmsQuotaInfo;
+import com.lcfc.starter.common.dto.sms.SmsTemplateInfo;
+import com.lcfc.starter.common.dto.web.PageResult;
+import com.lcfc.starter.common.exception.GlobalException;
+import com.lcfc.starter.common.web.threadlocal.UserThreadLocal;
+import com.lcfc.starter.redis.util.RedisUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Service
+@Slf4j
+public class SmsClientApprovalServiceIpml extends ServiceImpl<SmsClientMapper, SmsClient> implements SmsClientApprovalService {
+
+    @Value("${lcfc.mail.template-key}")
+    private String templateKey;
+    @Autowired
+    private AdminFeign adminFeign;
+
+    @Autowired
+    private SmsHandleBean handleBean;
+
+    @Autowired
+    private SmsClientMapper smsClientMapper;
+
+    @Autowired
+    private SmsClientServiceIpml smsClientService;
+
+    @Autowired
+    private SmsQuotaMapper smsQuotaMapper;
+
+    @Autowired
+    private SmsServerMapper smsServerMapper;
+
+    @Autowired
+    private SmsQuotaRechargeMapper smsQuotaRechargeMapper;
+
+    @Autowired
+    private SmsTemplateServiceImpl smsTemplateService;
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    @Qualifier("smsExecutors")
+    private ThreadPoolTaskExecutor executor;
+
+    @Autowired
+    private SmsInfoRedisInitUtil redisInitUtil;
+
+    @Value("${sms.config.client-topic}")
+    private String clientTopic;
+
+    @Value("${sms.config.template-topic}")
+    private String templateTopic;
+
+    @Override
+    public PageResult<SmsClientApprovalPageResp> paginQuery(SmsClientApprovalPageReq pageReq) {
+
+        // 审批中、已生效、未通过
+        List<Integer> statusList = new ArrayList<>();
+        statusList.add(ClientStatusEnums.IN_APPROVALED.getCode());
+        statusList.add(ClientStatusEnums.APPROVALED.getCode());
+        statusList.add(ClientStatusEnums.NOT_APPROVALED.getCode());
+
+        Page<SmsClient> pageServer = smsClientMapper.selectPage(new Page<>(pageReq.getPageNumber(), pageReq.getPageSize()),
+                Wrappers.<SmsClient>lambdaQuery()
+                        .in(SmsClient::getStatus, statusList)
+                        .eq(!Objects.isNull(pageReq.getClientId()), SmsClient::getClientId, pageReq.getClientId())
+                        .like(StringUtils.isNotEmpty(pageReq.getClientCode()),
+                                SmsClient::getClientCode, pageReq.getClientCode())
+                        .eq(StringUtils.isNotEmpty(pageReq.getAppCode()),
+                                SmsClient::getAppCode, pageReq.getAppCode())
+                        // 当状态传-1时 为查询全部数据
+                        .eq(pageReq.getStatus() != -1, SmsClient::getStatus, pageReq.getStatus())
+                        .orderByDesc(SmsClient::getCreateTime));
+
+        return PageUtils.toPageResult(pageServer, SmsClientApprovalPageResp::vo);
+    }
+
+    @Override
+    public void saveAndPass(SmsClientApprovalSaveAndPassReq req) {
+        SmsClient smsClient = req.entity();
+        Long clientId = smsClient.getClientId();
+        // 根据当前客户端状态判断是否需要审批
+        SmsClient entity = smsClientMapper.selectById(clientId);
+        entity.setInServerCode(smsClient.getInServerCode());
+        entity.setInServerId(smsClient.getInServerId());
+        entity.setOutServerCode(smsClient.getOutServerCode());
+        entity.setOutServerId(smsClient.getOutServerId());
+
+        Integer status = entity.getStatus();
+        if (Objects.equals(ClientStatusEnums.IN_APPROVALED.getCode(), status)) {
+            // 待审核需要走审批
+            smsClient.setStatus(ClientStatusEnums.APPROVALED.getCode());
+            smsClient.setReviewer(UserThreadLocal.getUserId().toString());
+            smsClient.setReviewerDate(new Date());
+
+            smsClientMapper.updateById(smsClient);
+            // 审批后自动创建两条额度表数据，一条国内额度，一条国外额度
+            List<SmsQuota> quotaList = createQuotaPair(smsClient);
+            smsQuotaMapper.insertBatch(quotaList);
+
+            // 推送客户端信息到redis
+            SmsClientInfo smsClientInfo =
+                    SmsClientApprovalServiceIpml.convertInfo(entity, smsQuotaMapper);
+
+            executor.execute(() -> {
+                SmsRedisUtil.sendRedisQueue(clientTopic, smsClientInfo);
+                SmsRedisUtil.addPut(SmsConstants.SMS_CLIENT, SmsClientInfo.class, smsClientInfo);
+                // 审批通过需要推送额度信息
+                // 20250422 第一次应该是当前客户端可用额度都推送 新增
+                firstPushQuota(smsClientInfo);
+            });
+
+        } else {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.STATUS_NOOPERATE));
+        }
+    }
+
+    private static List<SmsQuota> createQuotaPair(SmsClient smsClient) {
+        List<SmsQuota> quotaList = new ArrayList<>();
+
+        SmsQuota smsQuotaIn = new SmsQuota();
+        smsQuotaIn.setQuotaId(IdUtil.getSnowflakeNextId());
+        smsQuotaIn.setClientId(smsClient.getClientId());
+        smsQuotaIn.setCountryType(CountryTypeEnums.IN.getCode());
+        smsQuotaIn.setStatus(StatusEnums.NORMAL.getCode());
+        smsQuotaIn.setInitialQuota(0L);
+        smsQuotaIn.setUseQuota(0L);
+        smsQuotaIn.setCreateTime(new Date());
+        smsQuotaIn.setCreateUser(UserThreadLocal.getUserId().toString());
+
+        SmsQuota smsQuotaOut = new SmsQuota();
+        smsQuotaOut.setQuotaId(IdUtil.getSnowflakeNextId());
+        smsQuotaOut.setClientId(smsClient.getClientId());
+        smsQuotaOut.setCountryType(CountryTypeEnums.OUT.getCode());
+        smsQuotaOut.setStatus(StatusEnums.NORMAL.getCode());
+        smsQuotaOut.setInitialQuota(0L);
+        smsQuotaOut.setUseQuota(0L);
+        smsQuotaOut.setInitialAmount(BigDecimal.ZERO);
+        smsQuotaOut.setUseAmount(BigDecimal.ZERO);
+        smsQuotaOut.setCreateTime(new Date());
+        smsQuotaOut.setCreateUser(UserThreadLocal.getUserId().toString());
+
+        quotaList.add(smsQuotaIn);
+        quotaList.add(smsQuotaOut);
+        return quotaList;
+    }
+
+    @Override
+    public void save(SmsClientApprovalSaveAndPassReq req) {
+        Long clientId = req.getClientId();
+        SmsClient smsClient = smsClientMapper.selectById(clientId);
+
+        // 判断状态
+        if (!(ClientStatusEnums.APPROVALED.getCode().equals(smsClient.getStatus()))) {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.STATUS_NOOPERATE));
+        }
+
+        // 记录模板被至为待编辑状态ID
+        List<SmsTemplate> smsTemplateList = new ArrayList<>();
+
+        // 判断短信服务是否变更
+        Long oldInServerId = smsClient.getInServerId();
+        Long oldOutServerId = smsClient.getOutServerId();
+        Long inServerId = req.getInServerId();
+        Long outServerId = req.getOutServerId();
+        LambdaUpdateWrapper<SmsTemplate> inUpdateWrapper = null;
+        LambdaUpdateWrapper<SmsTemplate> outUpdateWrapper = null;
+        List<Long> inTemplateIds = new ArrayList<>();
+        List<Long> outTemplateIds = new ArrayList<>();
+        if (Objects.isNull(inServerId)
+                || !inServerId.equals(oldInServerId)) {
+            // 国内发生变更 -- 将对应的国内模板至为无效状态，需重新审核
+            smsTemplateList =
+                    smsTemplateService.list(Wrappers.<SmsTemplate>lambdaQuery()
+                            .eq(SmsTemplate::getClientId, clientId)
+                            .eq(SmsTemplate::getCountryType, CountryTypeEnums.IN.getCode()));
+            inTemplateIds = smsTemplateList.stream().map(smsTemplate -> {
+                return smsTemplate.getTemplateId();
+            }).collect(Collectors.toList());
+
+            inUpdateWrapper = new LambdaUpdateWrapper<>();
+            inUpdateWrapper.set(SmsTemplate::getStatus, TemplateStatusEnums.WAIT_APPROVALED.getCode());
+            inUpdateWrapper.set(SmsTemplate::getSignId, null);
+            inUpdateWrapper.set(SmsTemplate::getSignName, null);
+            inUpdateWrapper.set(SmsTemplate::getTemplateConvertContent, null);
+            inUpdateWrapper.set(SmsTemplate::getServerTemplateId, null);
+            if (Objects.isNull(inServerId)) {
+                inUpdateWrapper.set(SmsTemplate::getClientId, null);
+            }
+            inUpdateWrapper.set(SmsTemplate::getServerId, inServerId);
+            inUpdateWrapper.set(SmsTemplate::getServerCode, req.getInServerCode());
+            inUpdateWrapper.set(SmsTemplate::getUpdateTime, new Date());
+            inUpdateWrapper.set(SmsTemplate::getUpdateUser, UserThreadLocal.getUserId().toString());
+            inUpdateWrapper.in(SmsTemplate::getTemplateId, inTemplateIds);
+
+        }
+        if (Objects.isNull(outServerId)
+                || !outServerId.equals(oldOutServerId)) {
+            // 国际发生变更 -- 将对应的国内模板至为无效状态，需重新审核
+            smsTemplateList =
+                    smsTemplateService.list(Wrappers.<SmsTemplate>lambdaQuery()
+                            .eq(SmsTemplate::getClientId, clientId)
+                            .eq(SmsTemplate::getCountryType, CountryTypeEnums.OUT.getCode()));
+            outTemplateIds = smsTemplateList.stream().map(smsTemplate -> {
+                return smsTemplate.getTemplateId();
+            }).collect(Collectors.toList());
+
+            outUpdateWrapper = new LambdaUpdateWrapper<>();
+            outUpdateWrapper.set(SmsTemplate::getStatus, TemplateStatusEnums.WAIT_APPROVALED.getCode());
+            outUpdateWrapper.set(SmsTemplate::getSignId, null);
+            outUpdateWrapper.set(SmsTemplate::getSignName, null);
+            outUpdateWrapper.set(SmsTemplate::getTemplateConvertContent, null);
+            if (Objects.isNull(outServerId)) {
+                outUpdateWrapper.set(SmsTemplate::getClientId, null);
+            }
+            outUpdateWrapper.set(SmsTemplate::getServerTemplateId, null);
+            outUpdateWrapper.set(SmsTemplate::getServerId, outServerId);
+            outUpdateWrapper.set(SmsTemplate::getServerCode, req.getOutServerCode());
+            outUpdateWrapper.set(SmsTemplate::getUpdateTime, new Date());
+            outUpdateWrapper.set(SmsTemplate::getUpdateUser, UserThreadLocal.getUserId().toString());
+            outUpdateWrapper.in(SmsTemplate::getTemplateId, outTemplateIds);
+
+        }
+
+        LambdaUpdateWrapper<SmsClient> clientUpdateWrapper = new LambdaUpdateWrapper<>();
+        clientUpdateWrapper.set(SmsClient::getRecordDays, req.getRecordDays());
+        clientUpdateWrapper.set(SmsClient::getInThreshold, req.getInThreshold());
+        clientUpdateWrapper.set(SmsClient::getOutThreshold, req.getOutThreshold());
+        clientUpdateWrapper.set(SmsClient::getInServerId, req.getInServerId());
+        clientUpdateWrapper.set(SmsClient::getOutServerId, req.getOutServerId());
+        clientUpdateWrapper.set(SmsClient::getInServerCode, Objects.equals(req.getInServerId(), null)
+                ? null : req.getInServerCode());
+        clientUpdateWrapper.set(SmsClient::getOutServerCode, Objects.equals(req.getOutServerId(), null)
+                ? null : req.getOutServerCode());
+        clientUpdateWrapper.set(SmsClient::getThreshold, req.getThreshold());
+        clientUpdateWrapper.set(SmsClient::getUpdateTime, new Date());
+        clientUpdateWrapper.set(SmsClient::getUpdateUser, UserThreadLocal.getUserId().toString());
+        clientUpdateWrapper.eq(SmsClient::getClientId, clientId);
+
+
+        LambdaUpdateWrapper<SmsTemplate> finalInUpdateWrapper = inUpdateWrapper;
+        LambdaUpdateWrapper<SmsTemplate> finalOutUpdateWrapper = outUpdateWrapper;
+        LambdaUpdateWrapper<SmsClient> finalClientUpdateWrapper = clientUpdateWrapper;
+        List<Long> finalInTemplateIds = inTemplateIds;
+        List<Long> finalOutTemplateIds = outTemplateIds;
+        transactionTemplate.executeWithoutResult(action -> {
+            if (CollectionUtil.isNotEmpty(finalInTemplateIds)) {
+                smsTemplateService.update(finalInUpdateWrapper);
+            }
+            if (CollectionUtil.isNotEmpty(finalOutTemplateIds)) {
+                smsTemplateService.update(finalOutUpdateWrapper);
+            }
+            smsClientService.update(clientUpdateWrapper);
+        });
+
+
+        List<SmsTemplate> finalSmsTemplateList = smsTemplateList;
+
+        executor.execute(() -> {
+            if (finalSmsTemplateList.size() > 0) {
+
+                Map<Long, String> serMap = smsServerMapper.selectList(Wrappers.<SmsServer>lambdaQuery()
+                        .eq(SmsServer::getStatus, StatusEnums.NORMAL.getCode()))
+                        .stream().collect(Collectors.toMap(SmsServer::getServerId, SmsServer::getServerCode));
+
+                for (SmsTemplate item : finalSmsTemplateList) {
+
+                    ISmsHandler handler = handleBean.getSmsHandler(serMap.get(item.getServerId()));
+                    SmsTemplateInfo templateInfo = SmsTemplate.convertInfo(item, handler);
+
+                    SmsRedisUtil.sendRedisQueue(templateTopic, templateInfo);
+                    SmsRedisUtil.deletePut(SmsConstants.SMS_TEMPLATE
+                            + ":" + item.getClientId(), SmsTemplateInfo.class, templateInfo);
+                }
+            }
+
+            SmsClient item = smsClientMapper.selectById(clientId);
+            // 推送客户端信息到redis
+            SmsClientInfo smsClientInfo =
+                    SmsClientApprovalServiceIpml.convertInfo(item, smsQuotaMapper);
+
+            SmsRedisUtil.sendRedisQueue(clientTopic, smsClientInfo);
+            SmsRedisUtil.updatePut(SmsConstants.SMS_CLIENT, SmsClientInfo.class, smsClientInfo);
+        });
+    }
+
+    @Override
+    public void rejected(SmsClientApprovalRejectedReq req) {
+        SmsClient smsClient = req.entity();
+        Long clientId = smsClient.getClientId();
+        // 根据当前客户端状态判断是否需要审批
+        SmsClient entity = smsClientMapper.selectById(clientId);
+        if (!Objects.equals(ClientStatusEnums.IN_APPROVALED.getCode(), entity.getStatus())) {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.STATUS_NOREFUSE));
+        }
+        smsClient.setStatus(ClientStatusEnums.NOT_APPROVALED.getCode());
+        smsClient.setReviewer(UserThreadLocal.getUserId().toString());
+        smsClient.setReviewerDate(new Date());
+        smsClientMapper.updateById(smsClient);
+    }
+
+    @Override
+    public PageResult<SmsClientQuotaPageResp> paginQuotaQuery(SmsClientQuotaPageReq pageReq) {
+
+        Page<SmsQuota> pageServer = smsQuotaMapper.selectPage(new Page<>(pageReq.getPageNumber(), pageReq.getPageSize()),
+                Wrappers.<SmsQuota>lambdaQuery()
+                        .eq(SmsQuota::getClientId, pageReq.getClientId())
+                        .orderByDesc(SmsQuota::getCreateTime));
+
+        return PageUtils.toPageResult(pageServer, SmsClientQuotaPageResp::vo);
+    }
+
+    @Override
+    public SmsClientQuotaUsableResp usableQuota(Long clientId) {
+
+        // 过期时间 > 当前时间 有效可用额度
+        // 过期时间 <= 当前时间 无效可用额度
+//        List<SmsQuota> smsQuotas = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+//                .eq(SmsQuota::getClientId, clientId)
+//                .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode())
+//                .gt(SmsQuota::getExpireDate, new Date()));
+//        List<SmsQuota> smsQuotas = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+//                .eq(SmsQuota::getClientId, clientId)
+//                .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode()));
+        List<SmsQuota> smsQuotas = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+                .eq(SmsQuota::getClientId, clientId)
+                .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode()));
+        //余量从redis中获取
+        long inCount = 0L;
+        long inUsable = 0L;
+
+        long outCount = 0L;
+        long outUsable = 0L;
+        BigDecimal outTotalAmount = BigDecimal.ZERO;
+        BigDecimal outRemainAmount = BigDecimal.ZERO;
+
+        for(SmsQuota quota : smsQuotas){
+            Long count = Optional.ofNullable(quota.getInitialQuota()).orElse(0L);
+            Long useCount = Optional.ofNullable(quota.getUseQuota()).orElse(0L);
+            String key = SmsConstants.SMS_CLIENT_QUOTA + ":" + quota.getQuotaId();
+            long value = RedisUtil.getString(key)!=null?Long.parseLong(RedisUtil.getString(key)):(count - useCount);
+            if(Objects.equals(quota.getCountryType(), CountryTypeEnums.IN.getCode())){
+                inCount += count;
+                inUsable += value;
+            }else {
+                outCount += count;
+                outUsable += value;
+                // 国际短信金额统计（使用BigDecimal计算）
+                BigDecimal initialAmount = Optional.ofNullable(quota.getInitialAmount()).orElse(BigDecimal.ZERO);
+                BigDecimal useAmount = Optional.ofNullable(quota.getUseAmount()).orElse(BigDecimal.ZERO);
+                outTotalAmount = outTotalAmount.add(initialAmount);
+                outRemainAmount = outRemainAmount.add(initialAmount.subtract(useAmount));
+            }
+        }
+
+        // 国内短信累计
+//        Long inUsable = smsQuotas.stream()
+//                .filter(smsQuota
+//                        -> smsQuota.getCountryType() == CountryTypeEnums.IN.getCode())
+//                .map(smsQuota -> smsQuota.getInitialQuota() - smsQuota.getUseQuota())
+//                .mapToLong(Long::longValue).sum();
+//
+//        // 国际短信累计
+//        Long outUsable = smsQuotas.stream()
+//                .filter(smsQuota
+//                        -> smsQuota.getCountryType() == CountryTypeEnums.OUT.getCode())
+//                .map(smsQuota -> smsQuota.getInitialQuota() - smsQuota.getUseQuota())
+//                .mapToLong(Long::longValue).sum();
+
+        SmsClientQuotaUsableResp rtn = new SmsClientQuotaUsableResp();
+        rtn.setInCount(inCount);
+        rtn.setInUsable(inUsable);
+        rtn.setOutCount(outCount);
+        rtn.setOutUsable(outUsable);
+        rtn.setOutTotalAmount(setAmountScale(outTotalAmount));
+        rtn.setOutRemainAmount(setAmountScale(outRemainAmount));
+        return rtn;
+    }
+
+    @Override
+    public void deleteQuota(Long quotaId) {
+
+        SmsQuota quota = smsQuotaMapper.selectById(quotaId);
+        Long clientId = quota.getClientId();
+
+        int count = smsQuotaMapper.deleteById(quotaId);
+
+        if (count == 0) {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.DELETE_FAILED));
+        }
+
+        SmsClient smsClient = smsClientMapper.selectById(clientId);
+        // 判断客户端状态 是否审批完成-审批完成才推送redis
+        if (!Objects.equals(ClientStatusEnums.APPROVALED.getCode(), smsClient.getStatus())) {
+            return;
+        }
+        // 更新redis
+        pushClientInfo(smsClient, smsQuotaMapper, true, quota);
+    }
+
+    @Override
+    public void disableById(Long quotaId) {
+        SmsQuota smsQuota = smsQuotaMapper.selectById(quotaId);
+        smsQuota.setStatus(StatusEnums.DISABLE.getCode());
+        smsQuota.setUpdateTime(new Date());
+        smsQuota.setUpdateUser(UserThreadLocal.getUserId().toString());
+        smsQuotaMapper.updateById(smsQuota);
+        // 刷缓存
+        SmsClient smsClient = smsClientMapper.selectById(smsQuota.getClientId());
+        // 判断客户端状态 是否审批完成-审批完成才推送redis
+        if (!Objects.equals(ClientStatusEnums.APPROVALED.getCode(), smsClient.getStatus())) {
+            return;
+        }
+        // 更新redis
+        pushClientInfo(smsClient, smsQuotaMapper, true, smsQuota);
+    }
+
+    @Override
+    public void enableById(Long quotaId) {
+        SmsQuota smsQuota = smsQuotaMapper.selectById(quotaId);
+        // 判断过期时间
+//        if (!DateUtil.isAfter(smsQuota.getExpireDate(), new Date())) {
+//            throw new GlobalException(TipsEnum.getTips(TipsEnum.QUOTA_EXPIRE));
+//        }
+        smsQuota.setStatus(StatusEnums.NORMAL.getCode());
+        smsQuota.setUpdateTime(new Date());
+        smsQuota.setUpdateUser(UserThreadLocal.getUserId().toString());
+        smsQuotaMapper.updateById(smsQuota);
+        // 刷缓存
+        SmsClient smsClient = smsClientMapper.selectById(smsQuota.getClientId());
+        // 判断客户端状态 是否审批完成-审批完成才推送redis
+        if (!Objects.equals(ClientStatusEnums.APPROVALED.getCode(), smsClient.getStatus())) {
+            return;
+        }
+        pushClientInfo(smsClient, smsQuotaMapper, false, smsQuota);
+
+    }
+
+    @Override
+    public void addQuota(SmsQuotaAddReq smsQuotaAddReq) {
+
+        SmsQuota smsQuota = smsQuotaAddReq.entity();
+        // 判断过期时间
+//        if (!DateUtil.isAfter(smsQuotaAddReq.getExpireDate(), new Date())) {
+//            smsQuota.setStatus(StatusEnums.DISABLE.getCode());
+//        } else {
+//            smsQuota.setStatus(StatusEnums.NORMAL.getCode());
+//        }
+        smsQuota.setStatus(StatusEnums.NORMAL.getCode());
+        smsQuotaMapper.insert(smsQuota);
+
+        SmsClient smsClient = smsClientMapper.selectById(smsQuota.getClientId());
+
+        // 禁用状态不可推送 判断客户端状态 是否审批完成-审批完成才推送redis
+        if (Objects.equals(StatusEnums.DISABLE.getCode(), smsQuota.getStatus()) ||
+                !Objects.equals(ClientStatusEnums.APPROVALED.getCode(), smsClient.getStatus())) {
+            return;
+        }
+        // 更新redis
+        pushClientInfo(smsClient, smsQuotaMapper, false, smsQuotaMapper.selectById(smsQuota.getQuotaId()));
+
+    }
+
+    @Override
+    public void updateQuota(SmsQuotaUpdateReq smsQuotaUpdateReq) {
+        SmsQuota smsQuota = smsQuotaUpdateReq.entity();
+        SmsQuota item = smsQuotaMapper.selectById(smsQuota.getQuotaId());
+        if (item.getUseQuota() > smsQuota.getInitialQuota()) {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.INITIAL_QUOTA_NOTUNDER_USE_QUOTA));
+        }
+
+        // 判断过期时间
+//        if (!DateUtil.isAfter(smsQuota.getExpireDate(), new Date())) {
+//            smsQuota.setStatus(StatusEnums.DISABLE.getCode());
+//        } else {
+//            smsQuota.setStatus(StatusEnums.NORMAL.getCode());
+//        }
+        smsQuota.setStatus(StatusEnums.NORMAL.getCode());
+        int count = smsQuotaMapper.updateById(smsQuota);
+        if (count == 0) {
+            throw new GlobalException(TipsEnum.getTips(TipsEnum.UPDATE_FAILED));
+        }
+
+        SmsClient smsClient = smsClientMapper.selectById(smsQuotaUpdateReq.getClientId());
+        // 禁用状态不可推送 判断客户端状态 是否审批完成-审批完成才推送redis
+        if (Objects.equals(StatusEnums.DISABLE.getCode(), smsQuota.getStatus()) ||
+                !Objects.equals(ClientStatusEnums.APPROVALED.getCode(), smsClient.getStatus())) {
+            return;
+        }
+        // 推送客户端信息到redis
+        pushClientInfo(smsClient, smsQuotaMapper, false, smsQuotaMapper.selectById(smsQuota.getQuotaId()));
+    }
+
+    private void pushClientInfo(SmsClient smsClient, SmsQuotaMapper smsQuotaMapper,
+                                Boolean isDelete, SmsQuota smsQuota) {
+
+        executor.execute(() -> {
+            // 推送客户端信息到redis
+            SmsClientInfo smsClientInfo =
+                    SmsClientApprovalServiceIpml.convertInfo(smsClient, smsQuotaMapper);
+            SmsRedisUtil.sendRedisQueue(clientTopic, smsClientInfo);
+            SmsRedisUtil.updatePut(SmsConstants.SMS_CLIENT, SmsClientInfo.class, smsClientInfo);
+//            if (isDelete) {
+//                SmsRedisUtil.clearQuotaByServerOrderId(smsQuota.getServerOrderId());
+//            } else {
+//                SmsRedisUtil.addQuotaByServerOrderId(smsQuota.getServerOrderId(),
+//                        smsQuota.getInitialQuota() - smsQuota.getUseQuota());
+//            }
+            //额度模块重构后redis用quota_id作为额度的key
+            if (isDelete) {
+                SmsRedisUtil.clearQuotaById(String.valueOf(smsQuota.getQuotaId()));
+            } else {
+                SmsRedisUtil.addQuotaById(String.valueOf(smsQuota.getQuotaId()),
+                        smsQuota.getInitialQuota() - smsQuota.getUseQuota());
+            }
+        });
+    }
+
+    private void firstPushQuota(SmsClientInfo smsClientInfo) {
+        // 20250422
+//        smsClientInfo.getDomesticSmsQuota().stream().filter(item ->
+//                StringUtils.isNotEmpty(item.getServerOrderId())
+//        ).forEach(quota -> {
+//            String key = SmsConstants.SMS_CLIENT_QUOTA + ":"
+//                    + quota.getServerOrderId();
+//            SmsRedisUtil.initQuotaPut(key,
+//                    quota.getBuyLimit() - quota.getUsageLimit());
+//        });
+//        // 国外
+//        smsClientInfo.getInternationalSmsQuota().stream().filter(item ->
+//                StringUtils.isNotEmpty(item.getServerOrderId())
+//        ).forEach(quota -> {
+//            String key = SmsConstants.SMS_CLIENT_QUOTA + ":"
+//                    + quota.getServerOrderId();
+//            SmsRedisUtil.initQuotaPut(key,
+//                    quota.getBuyLimit() - quota.getUsageLimit());
+//        });
+        //重构，redis key使用quota_id
+        smsClientInfo.getDomesticSmsQuota().forEach(quota -> {
+            String key = SmsConstants.SMS_CLIENT_QUOTA + ":"
+                    + quota.getQuotaId();
+            SmsRedisUtil.initQuotaPut(key,
+                    quota.getBuyLimit() - quota.getUsageLimit());
+        });
+        // 国外
+        smsClientInfo.getInternationalSmsQuota().forEach(quota -> {
+            String key = SmsConstants.SMS_CLIENT_QUOTA + ":"
+                    + quota.getQuotaId();
+            SmsRedisUtil.initQuotaPut(key,
+                    quota.getBuyLimit() - quota.getUsageLimit());
+        });
+    }
+
+    public static SmsClientInfo convertInfo(SmsClient smsClient, SmsQuotaMapper mapper) {
+
+        // 客户端新增推到redis
+        // 查出可用额度
+//        List<SmsQuota> smsQuotas = mapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+//                .eq(SmsQuota::getClientId, smsClient.getClientId())
+//                .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode())
+//                .gt(SmsQuota::getExpireDate, new Date()));
+//        List<SmsQuota> smsQuotas = mapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+//                .eq(SmsQuota::getClientId, smsClient.getClientId())
+//                .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode()));
+        List<SmsQuota> smsQuotas = mapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+                        .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode())
+                        .eq(SmsQuota::getClientId, smsClient.getClientId()));
+
+        // 国内短信额度
+        List<SmsQuota> inQuota = smsQuotas.stream()
+                .filter(smsQuota
+                        -> smsQuota.getCountryType() == CountryTypeEnums.IN.getCode())
+                .collect(Collectors.toList());
+
+        // 国际短信累计
+        List<SmsQuota> outQuota = smsQuotas.stream()
+                .filter(smsQuota
+                        -> smsQuota.getCountryType() == CountryTypeEnums.OUT.getCode())
+                .collect(Collectors.toList());
+
+        SmsClientInfo smsClientInfo = new SmsClientInfo();
+        smsClientInfo.setClientId(smsClient.getClientId());
+        smsClientInfo.setClientCode(smsClient.getClientCode());
+        smsClientInfo.setSystemName(smsClient.getSystemName());
+        smsClientInfo.setAppCode(smsClient.getAppCode());
+        smsClientInfo.setAppName(smsClient.getAppName());
+        smsClientInfo.setLogSaveDays(smsClient.getRecordDays());
+        smsClientInfo.setDomesticSmsProviderId(smsClient.getInServerId());
+        smsClientInfo.setDomesticSmsProvider(smsClient.getInServerCode());
+        smsClientInfo.setDomesticSmsThreshold(smsClient.getInThreshold());
+        smsClientInfo.setInternationalSmsProviderId(smsClient.getOutServerId());
+        smsClientInfo.setInternationalSmsProvider(smsClient.getOutServerCode());
+        smsClientInfo.setInternationalSmsThreshold(smsClient.getOutThreshold());
+        List<SmsQuotaInfo> inQuotaInfos = inQuota.stream().map(item -> {
+            SmsQuotaInfo smsQuotaInfo = new SmsQuotaInfo();
+            smsQuotaInfo.setQuotaId(item.getQuotaId());
+            smsQuotaInfo.setBuyLimit(item.getInitialQuota());
+            smsQuotaInfo.setUsageLimit(item.getUseQuota());
+            smsQuotaInfo.setSmsType(item.getCountryType());
+            smsQuotaInfo.setExpireDate(item.getExpireDate());
+            smsQuotaInfo.setServerOrderId(item.getServerOrderId());
+            return smsQuotaInfo;
+        }).collect(Collectors.toList());
+        smsClientInfo.setDomesticSmsQuota(inQuotaInfos);
+        List<SmsQuotaInfo> outQuotaInfos = outQuota.stream().map(item -> {
+            SmsQuotaInfo smsQuotaInfo = new SmsQuotaInfo();
+            smsQuotaInfo.setQuotaId(item.getQuotaId());
+            smsQuotaInfo.setBuyLimit(item.getInitialQuota());
+            smsQuotaInfo.setUsageLimit(item.getUseQuota());
+            smsQuotaInfo.setSmsType(item.getCountryType());
+            smsQuotaInfo.setExpireDate(item.getExpireDate());
+            smsQuotaInfo.setServerOrderId(item.getServerOrderId());
+            return smsQuotaInfo;
+        }).collect(Collectors.toList());
+        smsClientInfo.setInternationalSmsQuota(outQuotaInfos);
+
+        smsClientInfo.setId(smsClient.getClientId());
+        return smsClientInfo;
+    }
+
+    @Override
+    public void refreshQuota() {
+        /**
+         * Map<String,SmsServer>
+         * #appId:SmsServer#
+         */
+//        // 取所有的服务
+//        List<SmsServer> smsServers =
+//                smsServerMapper.selectList(Wrappers.<SmsServer>lambdaQuery().eq(
+//                        SmsServer::getStatus, StatusEnums.NORMAL.getCode()
+//                ));
+//
+//        // 调用服务
+//        List<SmsPackagesReceipt> allReceipts = new ArrayList<>();
+//        for (SmsServer smsServer : smsServers) {
+//            String serverCode = smsServer.getServerCode();
+//            try {
+//                ISmsHandler handler = handleBean.getSmsHandler(serverCode);
+//                allReceipts.addAll(handler.smsPackagesStatistics(smsServer));
+//            } catch (Exception e) {
+//                log.error("调用服务更新额度失败", JSONObject.toJSON(smsServer));
+//                log.error("调用服务更新额度失败", e);
+//            }
+//        }
+//
+//        // 更新额度
+//        if (CollectionUtil.isEmpty(allReceipts)) {
+//            return;
+//        }
+//
+//        allReceipts.forEach(item -> {
+//            SmsQuota smsQuota = new SmsQuota();
+//            // 判断过期时间
+////            if (!DateUtil.isAfter(item.getExpireDate(), new Date())) {
+////                smsQuota.setStatus(StatusEnums.DISABLE.getCode());
+////            }
+//            smsQuota.setServerOrderId(item.getServerOrderId());
+//            smsQuota.setUseQuota(item.getUseQuota());
+//            smsQuota.setInitialQuota(item.getInitialQuota());
+//            smsQuota.setExpireDate(item.getExpireDate());
+//
+//            smsQuotaMapper.update(smsQuota, Wrappers.<SmsQuota>lambdaUpdate().eq(
+//                    SmsQuota::getServerOrderId, item.getServerOrderId()
+//            ));
+//        });
+
+        //删除从短信云服务商同步额度逻辑，改为从redis同步额度
+        //查询redis中所有客户端剩余额度信息同步到数据库
+//        List<SmsQuota> quotaList = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery().eq(
+//                SmsQuota::getStatus, StatusEnums.NORMAL.getCode()
+//        ));
+
+        // 预加载所有客户端的国际短信服务商单价
+        Map<Long, BigDecimal> clientUnitPriceMap = new HashMap<>();
+
+        List<SmsQuota> quotaList = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery());
+        quotaList.forEach(quota -> {
+            String key = SmsConstants.SMS_CLIENT_QUOTA + ":" + quota.getQuotaId();
+            String value = RedisUtil.getString(key);
+            if(value != null){
+                quota.setUseQuota(quota.getInitialQuota()-Long.parseLong(value));
+                //国际短信:根据redis的剩余条数更新已使用金额
+                if(Objects.equals(quota.getCountryType(), CountryTypeEnums.OUT.getCode())){
+                    BigDecimal unitPrice = clientUnitPriceMap.computeIfAbsent(quota.getClientId(), cid -> {
+                        SmsClient client = smsClientMapper.selectById(cid);
+                        return getUnitPriceFromServer(client.getOutServerId());
+                    });
+                    if (unitPrice != null && unitPrice.compareTo(BigDecimal.ZERO) > 0) {
+                        // 已使用金额 = 已使用条数(总条数-剩余条数) × 单价
+                        Long usedQuota = quota.getInitialQuota() - quota.getUseQuota();
+                        BigDecimal usedAmount = BigDecimal.valueOf(usedQuota).multiply(unitPrice);
+                        quota.setUseAmount(setAmountScale(usedAmount));
+                    }
+
+                }
+                //TODO 数据库批量更新
+                smsQuotaMapper.updateById(quota);
+            }
+        });
+
+        executor.execute(() -> {
+            log.info("定时任务同步额度刷新短信缓存开始。。。");
+//            SmsRedisUtil.clearClient();
+//            redisInitUtil.initClient();
+            log.info("定时任务同步额度刷新短信缓存结束。。。");
+
+        });
+
+        log.info("校验客户端额度预警开始。。。");
+
+        // 短信预警提醒
+        // 申请人集合
+        List<Long> _userIds = new ArrayList<>();
+        List<ClientMailSendParams> _sendItems = new ArrayList<>();
+
+        // 1. 取所有已生效客户端
+        List<SmsClient> smsClients = smsClientMapper.selectList(Wrappers.<SmsClient>lambdaQuery()
+                .eq(SmsClient::getStatus, ClientStatusEnums.APPROVALED.getCode()));
+        smsClients.forEach(item -> {
+            // 2. 取短信额度
+//            List<SmsQuota> smsQuotas = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+//                    .eq(SmsQuota::getClientId, item.getClientId())
+//                    .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode())
+//                    .gt(SmsQuota::getExpireDate, new Date()));
+            List<SmsQuota> smsQuotas = smsQuotaMapper.selectList(Wrappers.<SmsQuota>lambdaQuery()
+                    .eq(SmsQuota::getClientId, item.getClientId()));
+
+            if (smsQuotas.size() == 0) {
+                return;
+            }
+
+            // 3. 按国际国内统计计算
+            Long inInitial = smsQuotas.stream().filter(smsQuota
+                    -> smsQuota.getCountryType() == CountryTypeEnums.IN.getCode())
+                    .map(smsQuota -> smsQuota.getInitialQuota())
+                    .mapToLong(Long::longValue).sum();
+
+            Long inUsable = smsQuotas.stream()
+                    .filter(smsQuota
+                            -> smsQuota.getCountryType() == CountryTypeEnums.IN.getCode())
+                    .map(smsQuota -> smsQuota.getUseQuota())
+                    .mapToLong(Long::longValue).sum();
+
+            Long outInitial = smsQuotas.stream().filter(smsQuota
+                    -> smsQuota.getCountryType() == CountryTypeEnums.OUT.getCode())
+                    .map(smsQuota -> smsQuota.getInitialQuota())
+                    .mapToLong(Long::longValue).sum();
+
+            Long outUsable = smsQuotas.stream()
+                    .filter(smsQuota
+                            -> smsQuota.getCountryType() == CountryTypeEnums.OUT.getCode())
+                    .map(smsQuota -> smsQuota.getUseQuota())
+                    .mapToLong(Long::longValue).sum();
+
+
+            Double itemThreshold = item.getThreshold();
+            if (Objects.isNull(itemThreshold)) {
+                return;
+            }
+            BigDecimal threshold = new BigDecimal(itemThreshold);
+            // 计算是否超过预定的百分比
+            BigDecimal inDividend = new BigDecimal(inUsable);
+            BigDecimal inDivisor = new BigDecimal(Objects.equals(inInitial, 0L) ? 1 : inInitial);
+            BigDecimal inQuotient = inDividend.divide(inDivisor, 3, RoundingMode.HALF_UP);
+
+            BigDecimal outDividend = new BigDecimal(outUsable);
+            BigDecimal outDivisor = new BigDecimal(Objects.equals(outInitial, 0L) ? 1 : outInitial);
+            BigDecimal outQuotient = outDividend.divide(outDivisor, 3, RoundingMode.HALF_UP);
+
+            if (inQuotient.compareTo(threshold) < 0
+                    && outQuotient.compareTo(threshold) < 0) {
+                return;
+            }
+
+            _userIds.add(Long.parseLong(item.getApplicant()));
+            if (!(inQuotient.compareTo(threshold) < 0)) {
+
+                ClientMailSendParams clientMailSendParams = new ClientMailSendParams();
+
+                clientMailSendParams.setClientCode(item.getClientCode());
+                clientMailSendParams.setClientName(item.getSystemName());
+                clientMailSendParams.setAppName(item.getAppName());
+                clientMailSendParams.setSmsProvider(SmsServerEnums.getNameByCode(item.getInServerCode()));
+                clientMailSendParams.setWarningPercentage(threshold.doubleValue() * 100 + "%");
+                clientMailSendParams.setUsePercentage(inQuotient.doubleValue() * 100 + "%");
+                clientMailSendParams.setInitialSumQuota(inInitial);
+                clientMailSendParams.setUseSumQuota(inUsable);
+                clientMailSendParams.setType(CountryTypeEnums.IN.getCode());
+                clientMailSendParams.setUserId(item.getApplicant());
+                _sendItems.add(clientMailSendParams);
+            }
+
+            if (!(outQuotient.compareTo(threshold) < 0)) {
+
+                ClientMailSendParams clientMailSendParams = new ClientMailSendParams();
+
+                clientMailSendParams.setClientCode(item.getClientCode());
+                clientMailSendParams.setClientName(item.getSystemName());
+                clientMailSendParams.setAppName(item.getAppName());
+                clientMailSendParams.setSmsProvider(SmsServerEnums.getNameByCode(item.getOutServerCode()));
+                clientMailSendParams.setWarningPercentage(threshold.doubleValue() * 100 + "%");
+                clientMailSendParams.setUsePercentage(outQuotient.doubleValue() * 100 + "%");
+                clientMailSendParams.setInitialSumQuota(outInitial);
+                clientMailSendParams.setUseSumQuota(outUsable);
+                clientMailSendParams.setType(CountryTypeEnums.OUT.getCode());
+                clientMailSendParams.setUserId(item.getApplicant());
+                _sendItems.add(clientMailSendParams);
+            }
+        });
+
+        // 发送邮件提醒
+        if (CollectionUtil.isEmpty(_sendItems)) {
+            log.info("未发现预警额度，校验客户端额度预警结束。。。");
+            return;
+        }
+        UserInfoQryReq userInfoQryReq = new UserInfoQryReq();
+        userInfoQryReq.setUserIdList(_userIds);
+        String result = adminFeign.queryUserInfoByUserIdOrNumber(userInfoQryReq);
+        JSONObject jsonObject = JSONObject.parseObject(result);
+        JSONArray resultData = jsonObject.getJSONArray(Constant.RESULT_DATA);
+        List<UserInfoQryResp> respList =
+                JSON.parseArray(resultData.toString(), UserInfoQryResp.class);
+
+        Map<Long, UserInfoQryResp> userInfoMap = respList.stream()
+                .collect(Collectors.toMap(UserInfoQryResp::getUserId, Function.identity()));
+
+        _sendItems.forEach(item -> {
+            String redisKey = Constant.SMS_QUOTA_WARNING_REDIS + ":"
+                    + item.getClientCode() + ":" + item.getType();
+            // 校验当前客户端预警是否已经发送邮件
+            if (SmsRedisUtil.isExist(redisKey)) {
+                return;
+            }
+            ClientParam clientParam = MailParamsBuilder.chain()
+                    .receiver(userInfoMap.get(Long.parseLong(item.getUserId())).getUserEmail())
+                    .templateKey(templateKey)
+                    .templateParams(new HashMap<String, Object>() {{
+                        put("user_name", userInfoMap.get(Long.parseLong(item.getUserId())).getUserZhName());
+                        put("warning_value", item.getWarningPercentage());
+                        put("application_name", item.getAppName());
+                        put("sms_provider", item.getSmsProvider());
+                        put("sms_total_limit", item.getInitialSumQuota());
+                        put("sms_user_limit", item.getUseSumQuota());
+                        put("used_percent", item.getUsePercentage());
+                        put("sms_type", CountryTypeEnums.getCountryTypeNameByCode(item.getType()));
+                    }})
+                    .build();
+
+            // redis 设置值
+            SmsRedisUtil.set(redisKey, true);
+            SmsRedisUtil.expire(redisKey, DateUtil.getToDayLastTime());
+
+            //发送邮件
+            MailResponse send = MailClientUtil.send(clientParam);
+
+            log.info("发送邮件结果:{}", send);
+        });
+
+        log.info("校验客户端额度预警结束。。。");
+    }
+
+    @Override
+    public void quotaRecharge(SmsQuotaRechargeReq req) {
+        //根据clientId查询额度
+        SmsQuota smsQuota = smsQuotaMapper.selectOne(
+                Wrappers.<SmsQuota>lambdaQuery()
+                        .eq(SmsQuota::getClientId, req.getClientId())
+                        .eq(SmsQuota::getCountryType, req.getCountryType())
+                        .eq(SmsQuota::getStatus, StatusEnums.NORMAL.getCode()));
+        if (smsQuota == null){
+            throw new GlobalException("新增失败，额度id不存在");
+        }
+        Long quotaBefore = Optional.ofNullable(smsQuota.getInitialQuota())
+                .orElse(0L);
+        //新增额度充值记录
+        SmsQuotaRecharge smsQuotaRecharge = new SmsQuotaRecharge();
+        smsQuotaRecharge.setClientId(req.getClientId());
+        smsQuotaRecharge.setQuotaRechargeId(IdUtil.getSnowflake().nextId());
+        smsQuotaRecharge.setQuotaId(smsQuota.getQuotaId());
+        smsQuotaRecharge.setQuotaBefore(quotaBefore);
+        boolean isIn = req.getCountryType().equals(CountryTypeEnums.IN.getCode());
+        //区分国内外短信充值方式
+        if(isIn){
+            if(req.getQuotaChange() == null){
+                throw new GlobalException("新增失败，国内短信充值数量不能为空");
+            }
+            smsQuotaRecharge.setQuotaChange(req.getQuotaChange());
+            smsQuotaRecharge.setQuotaAfter(quotaBefore+req.getQuotaChange());
+        }else{
+            //国外短信，记录充值金额，根据服务商单价计算充值条数
+            if(req.getRechargeAmount() == null){
+                throw new GlobalException("新增失败，国际短信充值金额不能为空");
+            }
+            BigDecimal rechargeAmount = setAmountScale(req.getRechargeAmount());
+            smsQuotaRecharge.setRechargeAmount(rechargeAmount);
+            //根据客户端拿到国外服务商的参数
+            Long clientId = smsQuota.getClientId();
+            //获取国外服务商单价
+            Long outId = smsClientMapper.selectById(clientId).getOutServerId();
+            if(outId == null){
+                throw new GlobalException("新增失败，请先配置国外服务商");
+            }
+            BigDecimal unitPrice = getUnitPriceFromServer(outId);
+            if(unitPrice == null || unitPrice.compareTo(BigDecimal.ZERO) <= 0){
+                throw new GlobalException("新增失败，服务商单价配置无效");
+            }
+            smsQuotaRecharge.setUnitPrice(unitPrice);
+            // 计算充值条数：充值金额 / 单价（向下取整）
+            BigDecimal quotaChangeDecimal = rechargeAmount.divide(unitPrice, 0, RoundingMode.DOWN);
+            Long quotaChange = quotaChangeDecimal.longValue();
+            if (quotaChange <= 0) {
+                throw new GlobalException("充值金额不足以兑换1条短信");
+            }
+            smsQuotaRecharge.setQuotaChange(quotaChange);
+            smsQuotaRecharge.setQuotaAfter(quotaBefore + quotaChange);
+        }
+        smsQuotaRecharge.setCountryType(req.getCountryType());
+        smsQuotaRecharge.setStatus(StatusEnums.DISABLE.getCode());
+        smsQuotaRecharge.setRemark(req.getRemark());
+        smsQuotaRecharge.setCreateTime(new Date());
+        smsQuotaRecharge.setCreateUser(UserThreadLocal.getUserId().toString());
+        smsQuotaRechargeMapper.insert(smsQuotaRecharge);
+    }
+
+    /**
+     * 金额精度控制：保留5位小数
+     */
+    private static final int AMOUNT_SCALE = 5;
+    private static final RoundingMode AMOUNT_ROUNDING_MODE = RoundingMode.HALF_UP;
+
+    /**
+     * 设置金额精度（保留5位小数）
+     */
+    private BigDecimal setAmountScale(BigDecimal amount) {
+        if (amount == null) {
+            return BigDecimal.ZERO;
+        }
+        return amount.setScale(AMOUNT_SCALE, AMOUNT_ROUNDING_MODE);
+    }
+
+    /**
+     * 国际短信从服务商配置获取单价（返回BigDecimal，精度5位小数）
+     */
+    private BigDecimal getUnitPriceFromServer(Long serverId) {
+        if (serverId == null) {
+            return null;
+        }
+        SmsServer server = smsServerMapper.selectById(serverId);
+        if (server == null || StrUtil.isEmpty(server.getServerParams())) {
+            return null;
+        }
+        List<ServerParams> params = JSON.parseArray(server.getServerParams(), ServerParams.class);
+        for (ServerParams param : params) {
+            if ("unitPrice".equals(param.getKey()) && StrUtil.isNotEmpty(param.getValue())) {
+                try {
+                    BigDecimal unitPrice = new BigDecimal(param.getValue());
+                    return setAmountScale(unitPrice);
+                } catch (NumberFormatException e) {
+                    log.error("解析单价失败: {}", param.getValue(), e);
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    @Transactional
+    public void enableRecharge(Long quotaRechargeId){
+        SmsQuotaRecharge smsQuotaRecharge = smsQuotaRechargeMapper.selectById(quotaRechargeId);
+        if (smsQuotaRecharge == null){
+            throw new GlobalException("启用失败，充值记录不存在");
+        }
+        if (smsQuotaRecharge.getStatus().equals(StatusEnums.NORMAL.getCode())){
+            throw new GlobalException("启用失败，充值记录已启用");
+        }
+        smsQuotaRecharge.setStatus(StatusEnums.NORMAL.getCode());
+
+        //把数量加到额度上
+        SmsQuota smsQuota = smsQuotaMapper.selectById(smsQuotaRecharge.getQuotaId());
+        if (smsQuota == null) {
+            throw new GlobalException("启用失败，关联的额度记录不存在");
+        }
+        Long initial = Optional.ofNullable(smsQuota.getInitialQuota())
+                .orElse(0L);
+        Long new_quota = initial + smsQuotaRecharge.getQuotaChange();
+        smsQuota.setInitialQuota(new_quota);
+
+        //国际短信更新充值金额
+        if(Objects.equals(smsQuota.getCountryType(), CountryTypeEnums.OUT.getCode())){
+            BigDecimal initAmountBefore = Optional.ofNullable(smsQuota.getInitialAmount())
+                    .orElse(BigDecimal.ZERO);
+            BigDecimal rechargeAmount = Optional.ofNullable(smsQuotaRecharge.getRechargeAmount())
+                    .orElse(BigDecimal.ZERO);
+            BigDecimal newInitialAmount = initAmountBefore.add(rechargeAmount);
+            smsQuota.setInitialAmount(setAmountScale(newInitialAmount));
+            // 已使用金额保持不变
+            BigDecimal useAmount = Optional.ofNullable(smsQuota.getUseAmount())
+                    .orElse(BigDecimal.ZERO);
+            smsQuota.setUseAmount(setAmountScale(useAmount));
+        }
+        smsQuotaMapper.updateById(smsQuota);
+
+        //刷一下充值前和充值后的额度，取数据库最新的值
+        smsQuotaRecharge.setQuotaBefore(new_quota-smsQuotaRecharge.getQuotaChange());
+        smsQuotaRecharge.setQuotaAfter(new_quota);
+        smsQuotaRecharge.setUpdateTime(new Date());
+        smsQuotaRecharge.setUpdateUser(UserThreadLocal.getUserId().toString());
+        smsQuotaRechargeMapper.updateById(smsQuotaRecharge);
+
+        enableQuotaPushRedis(smsQuota, smsQuotaRecharge, initial, new_quota);
+
+    }
+
+    private void enableQuotaPushRedis(SmsQuota smsQuota, SmsQuotaRecharge smsQuotaRecharge, Long initial, Long new_quota) {
+        //通知redis客户端额度更新-key为客户端id，需要区分是审批前还是审批后，状态是未审批不推redis,已审批状态下再推
+        executor.execute(() -> {
+            SmsClient smsClient = smsClientMapper.selectById(smsQuota.getClientId());
+            if(Objects.equals(smsClient.getStatus(), ClientStatusEnums.APPROVALED.getCode())){
+                //更新redis额度
+                String key = SmsConstants.SMS_CLIENT_QUOTA + ":" + smsQuota.getQuotaId();
+                if(RedisUtil.hasKey(key)){
+                    RedisUtil.incr(key, smsQuotaRecharge.getQuotaChange());
+                }else{
+                    //redis不存在这个key
+                    //首次充值则数量为change,非首次充值可能是由于redis key丢失，数量取数据库差值
+                    Long _quota = initial > 0 ? new_quota - smsQuota.getUseQuota() : smsQuotaRecharge.getQuotaChange();
+                    SmsRedisUtil.initQuotaPut(key, _quota);
+                    log.info("首次启用充值额度，初始化短信额度到Redis, quotaId={}, available={}",
+                            smsQuota.getQuotaId(), initial + smsQuotaRecharge.getQuotaChange());
+                }
+            }
+        });
+    }
+
+    @Override
+    public void cancelRecharge(Long quotaRechargeId){
+        SmsQuotaRecharge smsQuotaRecharge = smsQuotaRechargeMapper.selectById(quotaRechargeId);
+        if (smsQuotaRecharge == null){
+            throw new GlobalException("删除失败，充值记录不存在");
+        }
+        if (smsQuotaRecharge.getStatus().equals(StatusEnums.NORMAL.getCode())){
+            throw new GlobalException("删除失败，充值记录已启用");
+        }
+        smsQuotaRechargeMapper.deleteById(quotaRechargeId);
+    }
+
+    @Override
+    public PageResult<SmsQuotaRechargePageResp> paginRechargeQuery(SmsQuotaRechargePageReq req) {
+        Page<SmsQuotaRecharge> pageServer = smsQuotaRechargeMapper.selectPage(new Page<>(req.getPageNumber(), req.getPageSize()),
+                Wrappers.<SmsQuotaRecharge>lambdaQuery()
+                        .eq(SmsQuotaRecharge::getClientId, req.getClientId())
+                        .orderByDesc(SmsQuotaRecharge::getCreateTime));
+        return PageUtils.toPageResult(pageServer, SmsQuotaRechargePageResp::vo);
+    }
+
+}
+
